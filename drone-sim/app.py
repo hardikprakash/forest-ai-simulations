@@ -97,7 +97,7 @@ def read_frames(video_path):
         if not success:
             # Video has ended
             # Move to next location
-
+    
 
             video.set(cv2.CAP_PROP_POS_FRAMES, 0)
             navigate_path()
