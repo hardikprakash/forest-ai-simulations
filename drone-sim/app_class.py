@@ -25,13 +25,13 @@ class Drone:
         self.locations = [i.split(".")[0] for i in dir_files if i.endswith(".mp4")]
         self.current_location = 0
         self.navigation_requested, self.navigate_to = False, None
-        self.frame_buffer, self.frame_lock = None, threading.lock()
+        self.frame_buffer, self.frame_lock = None, threading.Lock()
 
     def generate_token(self, username):
         """
         Create a timed token to authorise Requests to video stream.
         """
-        s = URLSafeTimedSerializer(self.app.config(['SECRET_KEY']))
+        s = URLSafeTimedSerializer(self.app.config['SECRET_KEY'])
         return s.dumps({'username':username})
     
     def verify_token(self, token):
@@ -107,8 +107,49 @@ class Drone:
         
 
     def generate_frames(self):
+        """
+        Generate frames which can be sent as responses.
+        """
         while True:
             with self.frame_lock:
                 if self.frame_buffer is not None:
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + self.frame_buffer + b'\r\n')
+    
+    def init_routes(self):
+
+        @self.app.route('/login', methods=['POST'])
+        def login():
+            username = request.json.get('username')
+            password = request.json.get('password')
+            
+            if (username == 'testUser' and password == 'testPass'):
+                token = self.generate_token(username=username)
+                return jsonify({'token': token})
+            
+            return jsonify({'message: Invalid credentials.'}), 401
+
+        @self.app.route('/video')
+        def video():
+            
+            token = request.args.get('token')
+            
+            if not token:
+                return jsonify({'message': 'Missing token.'}), 401
+
+            username = self.verify_token(token)
+            if not username:
+                return jsonify({'message': 'Invalid or expired token.'}), 401
+    
+            return Response(self.generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == '__main__':
+    drone = Drone()
+    drone.init_routes()
+
+    # Start the video reading in a separate thread
+    video_thread = threading.Thread(target=drone.read_frames)
+    video_thread.daemon = True
+    video_thread.start()
+
+    drone.app.run(host='0.0.0.0', port=5001)
