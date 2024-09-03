@@ -53,18 +53,18 @@ class VideoStreamer:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'fallback_key')
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(cur_dir)
-fallback_video_path = os.path.join(parent_dir, 'videos', 'vid.mp4')
-video_path = os.environ.get('VIDEO_PATH', fallback_video_path)
+# cur_dir = os.path.dirname(os.path.abspath(__file__))
+# parent_dir = os.path.dirname(cur_dir)
+# fallback_video_path = os.path.join(parent_dir, 'videos', 'vid.mp4')
+video_path = os.environ.get('VIDEO_PATH', './videos')
 
 if not app.config['SECRET_KEY']:
     logger.error("Secret key not configured. Exiting.")
-    sys.exit()
+    # sys.exit()
 
 if not video_path:
     logger.error("Video Path not configured. Exiting.")
-    sys.exit()
+    # sys.exit()
 
 users = {
     "testUser": "testPass"

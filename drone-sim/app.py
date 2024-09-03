@@ -1,151 +1,141 @@
+import cv2
+import os
 from flask import Flask, request, Response, jsonify
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 import threading
-import os
-import cv2
 import time
-from enum import Enum
-import itertools
 import sys
+import logging
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-users = {
-    "testUser": "testPass"
-}
+class Drone:
+    def __init__(self, secret_key, video_path):
+        self.app = Flask(__name__)
+        self.app.config['SECRET_KEY'] = secret_key
+        self.video_dir = video_path
 
-# Global Variables
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'temp_key')
-video_dir = os.environ.get('VIDEO_PATH', './videos/')
+        self.dir_files = [f for f in os.listdir(self.video_dir) if f.endswith(".mp4")]
+        if not self.dir_files:
+            logger.error("No video files found in the specified directory.")
+            sys.exit("Exiting due to missing video files")
 
-# Auto detect all .mp4 files in ./videos directory
-# Might need to create locks if API reads available locations.
-locations = os.listdir(video_dir)
-locations = [i for i in locations if (i.endswith(".mp4"))]
-n_locations = len(locations)
-if n_locations == 0:
-    print("No video files, exiting.")
-    sys.exit()
+        # Locations mapped to filenames without extension
+        self.locations = [os.path.splitext(f)[0] for f in self.dir_files]
+        self.current_location = 0
+        self.navigation_requested, self.navigate_to = False, None
+        self.frame_buffer, self.frame_lock = None, threading.Lock()
 
-# >>Itertools is compromising random location access.
-# location_loop = itertools.cycle(locations)
-# current_location = next(location_loop)
-
-move_ahead = False
-
-# Auth Token Management
-def generate_token(username):
-    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
-    return s.dumps({'username': username})
-
-def verify_token(token):
-    s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
-    try:
-        data = s.loads(token)
-        return data['username']
-    except SignatureExpired:
-        return None
-    except BadSignature:
-        return None
-
-def navigate_path(to_location=None):
-    """
-    Will simply move to next location if called without arguments.
-    Will try to move to a valid location if specified. Else, it logs an error to console and exits without changing location.
-    """
-    global current_location, locations, n_locations
+    def generate_token(self, username):
+        s = URLSafeTimedSerializer(self.app.config['SECRET_KEY'])
+        return s.dumps({'username': username})
     
-    # Move to next location
-    # Set video position to zero
+    def verify_token(self, token):
+        s = URLSafeTimedSerializer(self.app.config['SECRET_KEY'])
+        try:
+            data = s.loads(token)
+            return data['username']
+        except SignatureExpired:
+            logger.warning("Token has expired.")
+            return None
+        except BadSignature:
+            logger.warning("Invalid token signature.")
+            return None
 
-    if to_location is not None:
-        if not (to_location<n_locations):
-            print("Invalid location specified, moving ")
-        current_location = to_location
-        return
+    def navigate_path(self):
+        if self.navigate_to is None:
+            self.current_location = (self.current_location + 1) % len(self.locations)
+        elif isinstance(self.navigate_to, int) and 0 <= self.navigate_to < len(self.locations):
+            self.current_location = self.navigate_to
+            self.navigate_to, self.navigation_requested = None, False
+        else:
+            logger.warning("Unexpected navigation behavior, resetting to location 0.")
+            self.current_location = 0
 
-    if current_location < n_locations-1:
-        current_location+=1
-        return
+    def read_frames(self):
+        while True:
+            video_file = os.path.join(self.video_dir, self.locations[self.current_location] + '.mp4')
+            vid_capture = cv2.VideoCapture(video_file)
+
+            if not vid_capture.isOpened():
+                logger.error(f"Failed to open video file: {video_file}")
+                sys.exit("Exiting due to video file error")
+
+            fps = vid_capture.get(cv2.CAP_PROP_FPS) or 23.98
+            total_frames = int(vid_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            while True:
+                if self.navigation_requested:
+                    self.navigate_path()
+                    break
+
+                success, frame = vid_capture.read()
+
+                if not success or vid_capture.get(cv2.CAP_PROP_POS_FRAMES) >= total_frames:
+                    self.navigate_path()
+                    break
+
+                with self.frame_lock:
+                    ret, buffer = cv2.imencode('.jpg', frame)
+                    if not ret:
+                        logger.error("Failed to encode frame.")
+                        continue
+                    self.frame_buffer = buffer.tobytes()
+
+                time.sleep(1 / fps)
+
+    def generate_frames(self):
+        while True:
+            with self.frame_lock:
+                if self.frame_buffer is not None:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + self.frame_buffer + b'\r\n')
+            time.sleep(0.1)  # Small delay to avoid busy-waiting
+
+    def init_server(self):
+        @self.app.route('/login', methods=['POST'])
+        def login():
+            username = request.json.get('username')
+            password = request.json.get('password')
+            
+            if (username == 'testUser' and password == 'testPass'):
+                token = self.generate_token(username=username)
+                logger.info(f"User '{username}' logged in successfully.")
+                return jsonify({'token': token})
+            
+            logger.warning(f"Invalid login attempt for user '{username}'.")
+            return jsonify({'message': 'Invalid credentials.'}), 401
+        
+        @self.app.route('/video')
+        def video():
+            token = request.args.get('token')
+            
+            if not token:
+                logger.warning("Missing token in video stream request.")
+                return jsonify({'message': 'Missing token.'}), 401
+
+            username = self.verify_token(token)
+            if not username:
+                logger.warning("Invalid or expired token in video stream request.")
+                return jsonify({'message': 'Invalid or expired token.'}), 401
     
-    else:
-        current_location=0
-        return
-
-
-frame_buffer, frame_lock = None, threading.Lock()
-
-def read_frames(video_path):
-    global frame_buffer
-    
-    # Create video path:
-    video_path = video_dir + locations[current_location]
-    video = cv2.VideoCapture(video_path)
-
-    # >>Handle random location jumps.
-    # global move_ahead
-
-    # if move_ahead is True:
-    #     navigate_path
-
-
-    while True:
-        success, frame = video.read()
-
-        # Video has ended
-        # Move to next location
-        if not success:
-            # Video has ended
-            # Move to next location
-    
-
-            video.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            navigate_path()
-            continue
-
-        with frame_lock:
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_buffer = buffer.tobytes()
-
-        time.sleep(1/23.98)
-
-def generate_frames():
-    global frame_buffer
-
-    while True:
-        with frame_lock:
-            if frame_buffer is not None:
-                yield (b'--frame\r\n'
-                    b'Content-Type: image/jpeg\r\n\r\n' + frame_buffer + b'\r\n')
-
-
-@app.route('/login', methods=['POST'])
-def login():
-    username = request.json.get('username')
-    password = request.json.get('password')
-
-    if username in users and users[username] == password:
-        token = generate_token(username)
-        return jsonify({'token': token})
-    
-    return jsonify({'message': 'Invalid Credentials.'}), 401
-
-@app.route('/video')
-def video():
-    token = request.args.get('token')
-    if not token:
-        return jsonify({'message': 'Missing token.'}), 401
-    
-    username = verify_token(token)
-    if not username:
-        return jsonify({'message': 'Invalid or expired token.'}), 401
-    
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+            logger.info(f"User '{username}' is accessing the video stream.")
+            return Response(self.generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
+    secret_key = os.environ.get('FLASK_SECRET_KEY', 'fallback_key')
+    video_path = os.environ.get('VIDEO_PATH', './videos')
+    
+    drone = Drone(secret_key=secret_key, video_path=video_path)
 
-    video_thread = threading.Thread(target=read_frames, args=(video_path,))
-    video_thread.daemon = True
+    video_thread = threading.Thread(target=drone.read_frames, daemon=True)
     video_thread.start()
 
-    app.run(host='0.0.0.0', port=5001)
+    try:
+        logger.info("Starting Flask server on port 5001.")
+        drone.app.run(host='0.0.0.0', port=5001)
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user.")
+    finally:
+        logger.info("Exiting application.")
